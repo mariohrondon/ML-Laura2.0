@@ -13,56 +13,179 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import transformers
 from itertools import count
-from transformers import pipeline  # Nuevo: Para el QA con BioBERT
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import torch
+from sklearn.metrics.pairwise import cosine_similarity
+from typing import List, Dict, Optional, Tuple
 
-
-#Queria saber si los articulos que encontraban eran exactamente los del termino MeSH 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configuración inicial
+DEBUG_DIR = "debug_articles"
+os.makedirs(DEBUG_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('extraction_log.log')
+    ]
+)
 transformers.logging.set_verbosity_error()
 article_counter = count(1)
-# Cargar variables de entorno desde un archivo .env
 load_dotenv()
 
-# Configuración de la API de Entrez para poder realizar la recoleccion 
+# Constantes
+DEFAULT_RETURN = "No disponible"
+MAX_RETRIES = 3
+INITIAL_WAIT_TIME = 6
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+MAX_WORKERS = 4  # Número máximo de hilos para concurrent.futures
+QA_CONFIDENCE_THRESHOLD = 0.7
+
+# Configuración de la API de Entrez
 Entrez.email = os.getenv('EMAIL')
 Entrez.api_key = os.getenv('API_KEY')
 
-#Cargando el modelo QA y forzar la utilizacion de CPU
+
+
+class RAGSystem:
+    """Sistema de Retrieval-Augmented Generation para análisis de artículos científicos."""
+    
+    def __init__(self):
+        self.model = SentenceTransformer("all-MiniLM-L12-v2", device="cpu")
+        self.knowledge_base = []
+        self.embeddings = None
+        
+    def add_to_knowledge_base(self, documents: List[Dict]) -> None:
+        texts = [self._format_document(doc) for doc in documents]
+        self.knowledge_base.extend(documents)
+        
+        new_embeddings = self.model.encode(texts, convert_to_tensor=True)
+        if self.embeddings is None:
+            self.embeddings = new_embeddings
+        else:
+            self.embeddings = torch.cat([self.embeddings, new_embeddings])
+    
+    def _format_document(self, doc: Dict) -> str:
+        return f"Título: {doc.get('Titulo', '')}\nAutores: {doc.get('Autores', '')}\nResumen: {doc.get('Abstract', '')}\nTexto: {doc.get('Texto_Completo', '')}"
+    
+    def _split_into_chunks(self, text: str, chunk_size: int = 500) -> List[str]:
+        words = text.split()
+        return [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+    
+    def query(self, question: str, context: str, top_k: int = 3) -> List[Dict]:
+        chunks = self._split_into_chunks(context)
+        chunk_embeddings = self.model.encode(chunks, convert_to_tensor=True)
+        
+        question_embedding = self.model.encode(question, convert_to_tensor=True)
+        similarities = cosine_similarity(
+            question_embedding.unsqueeze(0).cpu().numpy(),
+            chunk_embeddings.cpu().numpy()
+        )[0]
+        
+        top_indices = np.argsort(similarities)[-top_k:][::-1]
+        return [{"text": chunks[i], "score": float(similarities[i])} for i in top_indices]
+
 def init_qa_model():
     return pipeline(
         "question-answering",
         model="ktrapeznikov/biobert_v1.1_pubmed_squad_v2",
         tokenizer="ktrapeznikov/biobert_v1.1_pubmed_squad_v2",
-        device=-1  # Forzar CPU
+        device=-1
     )
 
-qa_pipeline = init_qa_model()  # Carga al inicio del script
-
-#Extraer el Tamano de muestra mediante una Pregunta Espefica
-def extract_sample_size_with_qa(text):
-    question = "What is the exact sample size (number of participants) in this study? Report only the number."
+def validate_sample_size(number: str) -> bool:
+    """Valida si un número extraído es un tamaño de muestra plausible."""
     try:
-        result = qa_pipeline(question=question, context=text[:5000])  # Limitar contexto para CPU
-        answer = result["answer"].strip()
-        # Filtrar solo números (evitar porcentajes, años, etc.)
-        sample_size = "".join(filter(str.isdigit, answer))
-        return sample_size if sample_size else "No disponible"
-    except Exception as e:
-        logging.error(f"Error en QA: {e}")
-        return "No disponible"
+        n = int(number)
+        # Rangos plausibles para estudios clínicos/microbiológicos
+        return 10 <= n <= 1000000  # Ajustar según el dominio específico
+    except ValueError:
+        return False
 
-# Función para buscar en PubMed utilizando la libreria de Biopython
-def search_pubmed_mesh(term_mesh, max_results=10):
-    term_mesh += " AND free full text[Filter]" #Se puede anadir un filtro adicional dentro del MeSH Terms para poder acceder solo a los textos gratis
+def extract_numbers_with_context(text: str, patterns: List[str]) -> List[Tuple[str, str]]:
+    """Extrae números con su contexto cercano para análisis semántico."""
+    results = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            context_start = max(0, match.start() - 50)
+            context_end = min(len(text), match.end() + 50)
+            context = text[context_start:context_end].replace('\n', ' ')
+            results.append((match.group(1), context))
+    return results
+
+def filter_sample_size_candidates(candidates: List[Tuple[str, str]], qa_pipeline) -> Optional[str]:
+    """Filtra candidatos usando un modelo de QA para identificar el verdadero tamaño de muestra."""
+    question = "Is this number the exact total sample size of the study? Answer yes or no."
+    
+    for number, context in candidates:
+        try:
+            result = qa_pipeline(question=question, context=context)
+            if result['answer'].lower().startswith('yes') and result['score'] > QA_CONFIDENCE_THRESHOLD:
+                return number.replace(',', '')
+        except:
+            continue
+    return None
+
+def enhanced_sample_size_extraction(text: str, qa_pipeline, rag_system: RAGSystem) -> str:
+    # 1. Extracción con regex mejorada
+    patterns = [
+        r"(?:n\s*[=:]\s*|sample\s*size\s*of|included\s*)(\d{1,3}(?:,\d{3})*)",
+        r"(?:total\s+(?:of\s+)?|participants[:]?\s*)(\d{1,3}(?:,\d{3})*)\s+(?:participants|patients|women|subjects)",
+        r"\b(\d{2,})\s*(?:subjects|samples|cases|individuals|women|patients)\b",
+        r"study\s*population\s*of\s*(\d+)",
+        r"\b(\d+)\s*participants\b",
+        r"total\s*number\s*of\s*(\d+)\s*(?:cases|samples)"
+    ]
+    
+    # Extraer números con contexto
+    candidates = extract_numbers_with_context(text, patterns)
+    
+    # Filtrar solo números válidos
+    valid_candidates = [(num, ctx) for num, ctx in candidates if validate_sample_size(num.replace(',', ''))]
+    
+    if valid_candidates:
+        # 2. Filtrado semántico con BioBERT
+        best_candidate = filter_sample_size_candidates(valid_candidates, qa_pipeline)
+        if best_candidate:
+            return best_candidate
+        
+        # 3. Fallback: Seleccionar el número más grande en métodos/resultados
+        numbers = [int(num.replace(',', '')) for num, _ in valid_candidates]
+        return str(max(numbers)) if numbers else DEFAULT_RETURN
+    
+    # 4. Búsqueda con RAG como último recurso
+    try:
+        rag_results = rag_system.query("What is the total sample size of the study? Report only the number.", text, top_k=3)
+        for result in rag_results:
+            numbers = re.findall(r'\d{2,}', result['text'])
+            valid_numbers = [n for n in numbers if validate_sample_size(n)]
+            if valid_numbers:
+                return max(valid_numbers, key=int)
+    except Exception as e:
+        logging.error(f"Error en RAG: {e}")
+    
+    return DEFAULT_RETURN
+
+def search_pubmed_mesh(term_mesh: str, max_results: int = 100) -> List[str]:
+    term_mesh += " AND free full text[Filter]"
     handle = Entrez.esearch(db="pubmed", term=term_mesh, retmax=max_results)
     search_results = Entrez.read(handle)
     handle.close()
     return search_results['IdList']
-#Obtener mediante la afiliacion de cada autor el pais al que pertenecen.
-def get_country_from_affiliation(soup):
+
+def search_pubmed_mesh(term_mesh: str, max_results: int = 100) -> List[str]:
+    term_mesh += " AND free full text[Filter]"
+    handle = Entrez.esearch(db="pubmed", term=term_mesh, retmax=max_results)
+    search_results = Entrez.read(handle)
+    handle.close()
+    return search_results['IdList']
+
+def get_country_from_affiliation(soup: BeautifulSoup) -> str:
     affiliations_section = soup.find('div', class_='affiliations')
     if not affiliations_section:
-        return "No disponible"
+        return DEFAULT_RETURN
     
     affiliation_text = affiliations_section.get_text(separator=" ")
     countries = {country.name.lower(): country.name for country in pycountry.countries}
@@ -72,193 +195,202 @@ def get_country_from_affiliation(soup):
         if country_name in affiliation_text.lower():
             found_countries.add(countries[country_name])
     
-    return ", ".join(found_countries) if found_countries else "No disponible"
+    return ", ".join(found_countries) if found_countries else DEFAULT_RETURN
 
+def get_pmc_full_text(pmcid_url: str) -> str:
+    """Extrae el texto completo de un artículo en PMC."""
+    try:
+        response = requests.get(pmcid_url, headers={'User-Agent': USER_AGENT}, timeout=10)
+        if response.status_code == 200:
+            pmc_soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Eliminar elementos no deseados
+            for element in pmc_soup.find_all(['div', 'section']):
+                if 'ref-list' in element.get('class', []):
+                    element.decompose()
+                if 'fig' in element.get('class', []):
+                    element.decompose()
+            
+            # Extraer secciones principales
+            sections = []
+            for sec in pmc_soup.find_all(['div', 'section']):
+                if sec.get('id') in ['abstract', 'methods', 'results', 'discussion']:
+                    sections.append(sec.get_text(separator=' ', strip=True))
+            
+            return ' '.join(sections) if sections else DEFAULT_RETURN
+    except Exception as e:
+        logging.error(f"Error al obtener texto completo de PMC: {e}")
+    
+    return DEFAULT_RETURN
 
-# En caso no funciona el sistema QA, buscara mediante REGEX con terminos basicos 
-def get_study_population(article_text):
-    
-    patterns = [
-        r"(?:n\s*=\s*|sample size of|included\s)(\d+)",  # n=100 or "sample size of 100"
-        r"(?:a total of|total of|participants:|patients:|)\s(\d+)\s(?:participants|patients|women|pregnant women)",  # "a total of 100 participants"
-        r"\b(\d+)\s*(?:subjects|samples|cases)\b"  # "100 subjects"
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, article_text, re.IGNORECASE)
-        if match:
-            return match.group(1)  
-    
-    logging.debug(f"No se encontró patrón en: {article_text[:200]}...")
-    # Si no se encuentra con regex, usar QA como respaldo
-    return extract_sample_size_with_qa(article_text)
-
-    
-# Función para extraer datos de la página de PubMed ( previa para despues buscar PMC o articulos gratis)
-def extract_data(pubmed_id,max_attempts=4):
+def extract_data(pubmed_id: str) -> Optional[Dict]:
     base_url = f"https://pubmed.ncbi.nlm.nih.gov/{pubmed_id}/"
-    attempts = 0
-    max_attempts = 3
-    wait_time = 6 #Tiempo que esperara el programa para inicie, segundos.
-
-    while attempts < max_attempts:
-        response = requests.get(base_url)
-
-        if response.status_code ==200:
-            break #Exito 
-        elif response.status_code ==429:
-            logging.warning(f"Demasiadas Solicutudes (429) para {pubmed_id}. Reitentando en {wait_time} segundos...")
-            time.sleep(wait_time)
-            wait_time *= 2 #Aumentar el tiempo de espera exponecialmente
-            attempts += 1
-        elif response.status_code ==403:
-            logging.warning(f"Demasiadas Solicutudes (403) para {pubmed_id}. Reitentando en {wait_time} segundos...")
-            time.sleep(wait_time)
-            wait_time *= 3 #Aumentar el tiempo de espera exponecialmente
-            attempts += 1
-        else:
-            logging.warning(f"Articulo {pubmed_id} no se pudo cargar correctamente (Codigo {response.status_code})")
-            return None 
-
-    if response.status_code != 200:
-        logging.warning(f"Artículo {pubmed_id} no se pudo cargar correctamente (Código {response.status_code})")
-        return None
+    wait_time = INITIAL_WAIT_TIME
     
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(base_url, headers={'User-Agent': USER_AGENT})
+            
+            if response.status_code == 200:
+                break
+            elif response.status_code in [429, 403]:
+                time.sleep(wait_time)
+                wait_time *= 2
+            else:
+                return None
+        except Exception as e:
+            logging.error(f"Error al acceder a {pubmed_id}: {e}")
+            if attempt == MAX_RETRIES - 1:
+                return None
+            time.sleep(wait_time)
+            wait_time *= 2
+    
+    if response.status_code != 200:
+        return None
     
     soup = BeautifulSoup(response.text, 'html.parser')
     
-    # Verificar si es un artículo de acceso libre en PMC
+    # Extraer metadatos básicos
+    title = soup.find('h1', class_='heading-title').get_text(strip=True) if soup.find('h1', class_='heading-title') else DEFAULT_RETURN
+    authors_section = soup.find('div', class_='authors-list')
+    authors = re.findall(r"[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñäëïöüßøÅåÄÖÜçÇŠšŽž]+(?:\s[A-ZÁÉÍÓÚÜÑa-záéíóúüñäëïöüßøÅåÄÖÜçÇŠšŽž\-]+)+", authors_section.get_text()) if authors_section else [] 
+    
+    # Extraer PMCID y verificar acceso libre
     free_access = bool(soup.find('span', class_='text', string=re.compile('Free PMC article', re.IGNORECASE)))
     pmcid_link = soup.find('a', href=re.compile(r'https://www.ncbi.nlm.nih.gov/pmc/articles/PMC\d+'))
     pmcid_url = pmcid_link['href'] if pmcid_link else "No disponible"
     
-    # Obtener el enlace de PMCID
+    # obtener el enlance de PMCID
     pmcid_link = soup.find('a', class_='id-link', attrs={'href': re.compile(r'pmc\.ncbi\.nlm\.nih\.gov/articles/PMC\d+')})
     pmcid_url = pmcid_link['href'] if pmcid_link else "No disponible"
-    
-    # Extraccion del titulo del articulo 
-    title = soup.find('h1', class_='heading-title').get_text(strip=True) if soup.find('h1', class_='heading-title') else "No disponible"
 
-    # Intento de busqueda de autores usando Regex
-    authors_section = soup.find('div', class_='authors-list')
-    authors = re.findall(r"[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñäëïöüßøÅåÄÖÜçÇŠšŽž]+(?:\s[A-ZÁÉÍÓÚÜÑa-záéíóúüñäëïöüßøÅåÄÖÜçÇŠšŽž\-]+)+", authors_section.get_text()) if authors_section else [] 
+    # Extraer texto completo si está disponible en PMC
+    full_text = DEFAULT_RETURN
+    if free_access and pmcid_url != DEFAULT_RETURN:
+        full_text = get_pmc_full_text(pmcid_url)
     
-    
-    # Intento de buscar país en el texto por las afiliaciones que tiene cada autor
-    affiliated_countries = get_country_from_affiliation(soup)
-
-    # Extraer texto del artículo para análisis
-    article_text = soup.get_text()
-
-    
-    # Intento de buscar DOI mediante terminos Regex
+    # Extraer abstract
+    abstract = soup.find('div', class_='abstract-content')
+    abstract_text = abstract.get_text() if abstract else ""
+        
+    # Extraer otros metadatos
     doi_match = re.search(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", soup.get_text())
-    doi = doi_match.group(0) if doi_match else "No disponible"
-
-    # Intento de buscar Journal mediante el Soup
+    doi = doi_match.group(0) if doi_match else DEFAULT_RETURN
+    
     journal_section = soup.find('button', class_='journal-actions-trigger')
-    journal = journal_section.get_text(strip=True) if journal_section else "No disponible"
-
-    # Intento de buscar año de publicación
+    journal = journal_section.get_text(strip=True) if journal_section else DEFAULT_RETURN
+    
     year_match = re.search(r"\b(19|20)\d{2}\b", soup.get_text())
-    year = year_match.group(0) if year_match else "No disponible"
+    year = year_match.group(0) if year_match else DEFAULT_RETURN
 
-    # Verificar si es que tiene disponibilidad del texto completo
     free_access = bool(soup.find('span', class_='text', string=re.compile('Free PMC article', re.IGNORECASE)))
     
-
-    sample_size = "No disponible" #poner en default de que no hay 
-    
-    if free_access:
-        idx = next(article_counter)  # para que cuente los articulos que encuentra para ver en el Terminal
-        print(f"{idx}. Artículo {pubmed_id} - Free Access: {free_access}, PMCID Link: {bool(pmcid_link)}") #Para Verificar si es Libre Acceso y el ID del PudmeD
-        
-        pmcid_link = soup.find('a', href=re.compile(r'pmc/articles/PMC\d+'))
-        if pmcid_link and (pmc_url := pmcid_link['href']):
-            if not pmc_url.startswith(('http://', 'https://')):
-                pmc_url = f"https://www.ncbi.nlm.nih.gov{pmc_url}"
-            
-            print(f"PMC URL: {pmc_url}")  # Para verificar si encontro o no (DEBUG)
-            
-            try:
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-}  #Para evitar el error 403
-                pmc_response = requests.get(pmc_url, headers=headers, timeout=10)
-                #Para buscar en resultados y en metodos
-                if pmc_response.status_code == 200:
-                    pmc_soup = BeautifulSoup(pmc_response.text, 'html.parser')
-                    methods_section = pmc_soup.find('sec', {'sec-type': 'methods'}) or ''
-                    results_section = pmc_soup.find('sec', {'sec-type': 'results'}) or ''
-                    sample_size = get_study_population(f"{methods_section} {results_section}")
-            except Exception as e:
-                logging.error(f"Error PMC: {e}")
-    
-    # Si aún no se encontró, buscar en el abstract/resumen
-    if sample_size == "No disponible":
-        abstract = soup.find('div', class_='abstract-content')
-        abstract_text = abstract.get_text() if abstract else ""
-        sample_size = get_study_population(abstract_text)
-    
-    #Si no encuentra nada me guarda el HTML para una correcion Manual
-    if not abstract:
-        with open(f"debug_article_{pubmed_id}.html", "w", encoding="utf-8") as f:
-            f.write(str(soup))
-        logging.warning(f"Artículo {pubmed_id} sin abstract - HTML guardado para debug")
-        
-    # Extraer la informacion y Ordenanas en el Excel
     return {
         'Titulo': title,
-        'PMC Free Access': "Si, PMC" if free_access else "No, but has Free Article",
+        'PMC Free Access': "Sí" if free_access else "No",
         'Autores': ", ".join(authors),
-        'Paises Afiliados': affiliated_countries,
+        'Paises Afiliados': get_country_from_affiliation(soup),
         'DOI': doi,
         'NCBI ID': pubmed_id,
         'Journal': journal,
-        'Anio de Publicacion': year,
+        'Año de Publicacion': year,
         'Enlace al articulo': base_url,
-        'Numero de Participantes': sample_size,
+        'Texto_Completo': full_text,
+        'Abstract': abstract_text,
         'PMCID URL': pmcid_url
-         
     }
 
-# Main
-if __name__ == "__main__":
-    start_time = time.time()  # Tiempo de inicio
-    
-    term_mesh = '((((all[sb] NOT(animals [mh] NOT humans [mh])) AND (microbiota [mh])) AND (female genitalia[MeSH Terms]) ) AND (("2010/07/01"[Date - Publication] : "2024/07/21"[Date - Publication]))) NOT (Review[Publication Type])'
-    max_results = 8000
-
-    article_ids = search_pubmed_mesh(term_mesh, max_results)
-    results = []
-
-    logging.info(f"Se encontraron {len(article_ids)} artículos para analizar.")
-
-#Optimizacion de busqueda mediante hilos, realiza las tareas de manera bastante rapida.
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_pubmed = {executor.submit(extract_data, pubmed_id): pubmed_id for pubmed_id in article_ids}    
+def process_article(pubmed_id: str, qa_pipeline, rag_system: RAGSystem) -> Tuple[str, Optional[Dict]]:
+    try:
+        article_data = extract_data(pubmed_id)
+        if not article_data:
+            return (pubmed_id, None)
         
-        for future in concurrent.futures.as_completed(future_to_pubmed):
-            article_data = future.result()
-            if article_data:  
-                results.append(article_data) 
+        # Extraer tamaño de muestra con el sistema mejorado
+        context = f"{article_data.get('Abstract', '')} {article_data.get('Texto_Completo', '')}"
+        article_data['Numero de Participantes'] = enhanced_sample_size_extraction(
+            context, 
+            qa_pipeline, 
+            rag_system
+        )
+        
+        # Añadir a la base de conocimiento RAG si tiene texto completo
+        if article_data['PMC Free Access'] == "Sí":
+            rag_system.add_to_knowledge_base([article_data])
+        
+        return (pubmed_id, article_data)
+    except Exception as e:
+        logging.error(f"Error procesando artículo {pubmed_id}: {e}")
+        return (pubmed_id, None)
 
-    # Guardar resultados en CSV
-    df = pd.DataFrame(results)
-    df.to_excel('resultados_ayuda1.xlsx', index=False, engine='openpyxl')
-
-    # Aplicar formato condicional para pintar celdas
-    wb = load_workbook('resultados_ayuda1.xlsx')
-    ws = wb.active
-    fill = PatternFill(start_color="4c2882", end_color="4c2882", fill_type="lightHorizontal")
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-        for cell in row:
-            if cell.value == "No disponible":
-                cell.fill = fill
-    wb.save('resultados_ayuda1.xlsx')
-    logging.info("Archivo guardado con resaltado en 'resultados_ayuda1.xlsx'")
+if __name__ == "__main__":
+    start_time = time.time()
     
-
-    end_time = time.time()  # Tiempo de finalización
-    logging.info(f"Resultados guardados en 'resultados_ayuda1.csv'")
-    print(f"Tiempo total de ejecución: {end_time - start_time:.2f} segundos")
+    # Inicializar modelos
+    logging.info("Inicializando modelos de NLP...")
+    qa_pipeline = init_qa_model()
+    rag_system = RAGSystem()
+    
+    # Búsqueda en PubMed
+    term_mesh = '((((all[sb] NOT(animals [mh] NOT humans [mh])) AND (microbiota [mh])) AND (female genitalia[MeSH Terms]) ) AND (("2010/07/01"[Date - Publication] : "2024/07/21"[Date - Publication]))) NOT (Review[Publication Type])'
+    
+    logging.info(f"Buscando artículos con término MeSH: {term_mesh}")
+    article_ids = search_pubmed_mesh(term_mesh, max_results=100)
+    logging.info(f"Encontrados {len(article_ids)} artículos potenciales")
+    
+    # Procesamiento concurrente
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Preparar las tareas
+        future_to_id = {
+            executor.submit(process_article, pubmed_id, qa_pipeline, rag_system): pubmed_id 
+            for pubmed_id in article_ids
+        }
+        
+        # Procesar los resultados a medida que estén disponibles
+        completed = 0
+        for future in concurrent.futures.as_completed(future_to_id):
+            pubmed_id = future_to_id[future]
+            completed += 1
+            try:
+                processed_id, article_data = future.result()
+                if article_data:
+                    results.append(article_data)
+                    logging.info(f"[{completed}/{len(article_ids)}] Artículo {processed_id} procesado")
+                    logging.info(f"  - Título: {article_data['Titulo'][:50]}...")
+                    logging.info(f"  - PMCID: {article_data['PMCID URL']}")
+                    logging.info(f"  - Muestra: {article_data['Numero de Participantes']}")
+            except Exception as e:
+                logging.error(f"Error al procesar artículo {pubmed_id}: {e}")
+    
+    # Guardar resultados
+    if results:
+        df = pd.DataFrame(results)
+        output_file = 'resultados_mejorados.xlsx'
+        df.to_excel(output_file, index=False, engine='openpyxl')
+        
+        # Formato condicional
+        wb = load_workbook(output_file)
+        ws = wb.active
+        red_fill = PatternFill(start_color="Ff00ff", end_color="Ff00ff", fill_type="solid")
+        yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+        
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+            for cell in row:
+                if cell.value == DEFAULT_RETURN:
+                    cell.fill = red_fill
+                elif cell.column_letter == 'K' and not str(cell.value).isdigit():  # Columna de tamaño de muestra
+                    cell.fill = yellow_fill
+        
+        wb.save(output_file)
+        logging.info(f"Resultados guardados en {output_file}")
+        logging.info(f"Total de artículos procesados: {len(results)}")
+        logging.info(f"Artículos con texto completo: {len([r for r in results if r['PMC Free Access'] == 'Sí'])}")
+        logging.info(f"Tamaños de muestra encontrados: {len([r for r in results if r['Numero de Participantes'] != DEFAULT_RETURN])}")
+    else:
+        logging.warning("No se encontraron artículos válidos para procesar")
+    
+    # Estadísticas finales
+    elapsed_time = time.time() - start_time
+    logging.info(f"Proceso completado en {elapsed_time:.2f} segundos")
+    logging.info(f"Velocidad: {len(results)/elapsed_time:.2f} artículos/segundo")
